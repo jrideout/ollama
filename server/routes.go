@@ -668,27 +668,22 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		r.Response = sbContent.String()
 		r.Logprobs = allLogprobs
 
-		if s.PostInferenceConfigured() {
-			verdict := s.PostInference(c, "/api/generate", r.Model, r.Response, toolCallsToHook(r.ToolCalls))
-			if verdict.Terminated() {
-				c.AbortWithStatusJSON(verdict.HTTPStatus(), gin.H{
-					"action": verdict.Action,
-					"error":  verdict.Action + " by inference hook: " + verdict.Reason,
-					"reason": verdict.Reason,
-				})
-				return
-			}
-			r.Response = verdict.OutputText
-			r.ToolCalls = toolCallsFromHook(verdict.ToolCalls)
+		text, thinking, calls, done := s.applyPostInference(c, "/api/generate", r.Model, r.Response, r.Thinking, r.ToolCalls)
+		if done {
+			return
 		}
+		r.Response = text
+		r.Thinking = thinking
+		r.ToolCalls = calls
 
 		c.JSON(http.StatusOK, r)
 		return
 	}
 
-	// TODO: streaming post-inference hook — fires once at stream end;
-	// content has already been flushed so only "modify the Done chunk with
+	// TODO: streaming post-inference — fires once at stream end; content
+	// is already flushed so only "modify the Done chunk with
 	// content_filter" is viable. Wire via streamResponse when scoped.
+	s.WarnStreamingPostHookSkipped("/api/generate")
 	streamResponse(c, ch)
 }
 
@@ -1736,9 +1731,8 @@ func (s *Server) GenerateRoutes(rc *ollama.Registry) (http.Handler, error) {
 	// TODO(cloud-stage-a): apply Modelfile overlay deltas for local models with cloud
 	// parents on v1 request families while preserving this explicit :cloud passthrough.
 	//
-	// Note: the inference hook middleware is inserted AFTER the format-conversion
-	// middleware (ChatMiddleware, etc.) so it always sees the normalized
-	// api.ChatRequest / api.GenerateRequest body shape.
+	// Hook middleware runs AFTER format-conversion (ChatMiddleware etc.) so it
+	// sees the normalized api.ChatRequest / api.GenerateRequest body.
 	cloudFallback := cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable)
 	r.POST("/v1/chat/completions", s.hookedChain("/v1/chat/completions", []gin.HandlerFunc{cloudFallback, middleware.ChatMiddleware()}, s.ChatHandler)...)
 	r.POST("/v1/completions", s.hookedChain("/v1/completions", []gin.HandlerFunc{cloudFallback, middleware.CompletionsMiddleware()}, s.GenerateHandler)...)
@@ -1808,7 +1802,9 @@ func Serve(ln net.Listener) error {
 	if err := s.initRequestLogging(); err != nil {
 		return err
 	}
-	s.initInferenceHook()
+	if err := s.initInferenceHook(); err != nil {
+		return err
+	}
 
 	var rc *ollama.Registry
 	if useClient2 {
@@ -2641,25 +2637,20 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			resp.Message.ToolCalls = toolCalls
 		}
 
-		if s.PostInferenceConfigured() {
-			verdict := s.PostInference(c, "/api/chat", resp.Model, resp.Message.Content, toolCallsToHook(resp.Message.ToolCalls))
-			if verdict.Terminated() {
-				c.AbortWithStatusJSON(verdict.HTTPStatus(), gin.H{
-					"action": verdict.Action,
-					"error":  verdict.Action + " by inference hook: " + verdict.Reason,
-					"reason": verdict.Reason,
-				})
-				return
-			}
-			resp.Message.Content = verdict.OutputText
-			resp.Message.ToolCalls = toolCallsFromHook(verdict.ToolCalls)
+		text, thinking, calls, done := s.applyPostInference(c, "/api/chat", resp.Model, resp.Message.Content, resp.Message.Thinking, resp.Message.ToolCalls)
+		if done {
+			return
 		}
+		resp.Message.Content = text
+		resp.Message.Thinking = thinking
+		resp.Message.ToolCalls = calls
 
 		c.JSON(http.StatusOK, resp)
 		return
 	}
 
 	// TODO: streaming post-inference — see note in GenerateHandler.
+	s.WarnStreamingPostHookSkipped("/api/chat")
 	streamResponse(c, ch)
 }
 

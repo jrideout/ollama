@@ -255,13 +255,13 @@ var (
 	GpuDeviceOrdinal      = String("GPU_DEVICE_ORDINAL")
 	HsaOverrideGfxVersion = String("HSA_OVERRIDE_GFX_VERSION")
 
-	// Inference webhook configuration. When both HookURLPreInference and
-	// HookURLPostInference are empty, the inference webhook middleware is
+	// Inference webhook configuration. When both HookPreInferenceURL and
+	// HookPostInferenceURL are empty, the inference webhook middleware is
 	// not registered and no overhead is added.
 	//
 	// See server/inference_hook.go for the wire protocol.
-	HookURLPreInference  = String("OLLAMA_HOOK_URL_PRE_INFERENCE")
-	HookURLPostInference = String("OLLAMA_HOOK_URL_POST_INFERENCE")
+	HookPreInferenceURL  = String("OLLAMA_HOOK_PRE_INFERENCE_URL")
+	HookPostInferenceURL = String("OLLAMA_HOOK_POST_INFERENCE_URL")
 	HookOnError          = String("OLLAMA_HOOK_ON_ERROR") // "deny" (default) | "allow"
 )
 
@@ -277,10 +277,10 @@ func HookTimeout() time.Duration {
 }
 
 // HookHeaders returns the extra request headers configured via the
-// OLLAMA_HOOK_HEADER environment variable. The variable holds a
+// OLLAMA_HOOK_HEADERS environment variable. The variable holds a
 // comma-separated list of "name:value" pairs.
 func HookHeaders() []string {
-	s := Var("OLLAMA_HOOK_HEADER")
+	s := Var("OLLAMA_HOOK_HEADERS")
 	if s == "" {
 		return nil
 	}
@@ -368,11 +368,11 @@ func AsMap() map[string]EnvVar {
 		"OLLAMA_REMOTES":            {"OLLAMA_REMOTES", Remotes(), "Allowed hosts for remote models (default \"ollama.com\")"},
 
 		// Inference webhooks (optional — see docs/inference-webhooks.mdx)
-		"OLLAMA_HOOK_URL_PRE_INFERENCE":  {"OLLAMA_HOOK_URL_PRE_INFERENCE", HookURLPreInference(), "URL POSTed with each inference request for inspection/modification/blocking before it reaches the model"},
-		"OLLAMA_HOOK_URL_POST_INFERENCE": {"OLLAMA_HOOK_URL_POST_INFERENCE", HookURLPostInference(), "URL POSTed with each assembled inference response before it is returned to the client"},
+		"OLLAMA_HOOK_PRE_INFERENCE_URL":  {"OLLAMA_HOOK_PRE_INFERENCE_URL", HookPreInferenceURL(), "URL POSTed with each inference request for inspection/modification/blocking before it reaches the model"},
+		"OLLAMA_HOOK_POST_INFERENCE_URL": {"OLLAMA_HOOK_POST_INFERENCE_URL", HookPostInferenceURL(), "URL POSTed with each assembled inference response before it is returned to the client"},
 		"OLLAMA_HOOK_TIMEOUT":            {"OLLAMA_HOOK_TIMEOUT", HookTimeout(), "Per-request timeout for inference webhook calls (default \"5s\")"},
 		"OLLAMA_HOOK_ON_ERROR":           {"OLLAMA_HOOK_ON_ERROR", HookOnError(), "Behavior when the webhook errors or times out: \"deny\" (default, fail-closed) or \"allow\" (fail-open)"},
-		"OLLAMA_HOOK_HEADER":             {"OLLAMA_HOOK_HEADER", Var("OLLAMA_HOOK_HEADER"), "Comma-separated list of \"Name:Value\" headers to attach to every webhook request (e.g. for auth)"},
+		"OLLAMA_HOOK_HEADERS":            {"OLLAMA_HOOK_HEADERS", Var("OLLAMA_HOOK_HEADERS"), "Comma-separated list of \"Name:Value\" headers to attach to every webhook request (e.g. for auth)"},
 
 		// Informational
 		"HTTP_PROXY":  {"HTTP_PROXY", String("HTTP_PROXY")(), "HTTP proxy"},

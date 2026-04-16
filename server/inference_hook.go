@@ -1,14 +1,8 @@
 package server
 
-// Inference webhooks — an optional mechanism to hand off each inference
-// request and response to an external HTTP endpoint for inspection,
-// modification, or blocking. Designed as a vendor-neutral extension point so
-// third-party guardrail/observability/policy systems can plug in without
-// Ollama depending on any of them.
-//
-// Enabled by setting OLLAMA_HOOK_URL_PRE_INFERENCE and/or
-// OLLAMA_HOOK_URL_POST_INFERENCE. Both unset → zero overhead, no middleware
-// is added to the handler chain.
+// Optional HTTP webhooks that inspect, modify, block, or request
+// approval for each inference request/response. See
+// docs/inference-webhooks.mdx for the wire protocol.
 
 import (
 	"bytes"
@@ -19,7 +13,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -29,8 +25,6 @@ import (
 	"github.com/ollama/ollama/envconfig"
 )
 
-// inferenceHook carries the HTTP configuration used by both pre- and
-// post-inference webhook calls.
 type inferenceHook struct {
 	preURL  string
 	postURL string
@@ -40,13 +34,21 @@ type inferenceHook struct {
 	client  *http.Client
 }
 
-// newInferenceHook reads the relevant OLLAMA_HOOK_* environment variables and
-// returns a configured hook if any URLs are set, nil otherwise.
-func newInferenceHook() *inferenceHook {
-	pre := envconfig.HookURLPreInference()
-	post := envconfig.HookURLPostInference()
+// newInferenceHook returns a configured hook if any OLLAMA_HOOK_*_URL is
+// set, nil otherwise. Invalid config returns an error so startup fails
+// fast.
+func newInferenceHook() (*inferenceHook, error) {
+	pre := envconfig.HookPreInferenceURL()
+	post := envconfig.HookPostInferenceURL()
 	if pre == "" && post == "" {
-		return nil
+		return nil, nil
+	}
+
+	if err := validateHookURL("OLLAMA_HOOK_PRE_INFERENCE_URL", pre); err != nil {
+		return nil, err
+	}
+	if err := validateHookURL("OLLAMA_HOOK_POST_INFERENCE_URL", post); err != nil {
+		return nil, err
 	}
 
 	timeout := envconfig.HookTimeout()
@@ -72,29 +74,46 @@ func newInferenceHook() *inferenceHook {
 		onError: onErr,
 		headers: headers,
 		client:  &http.Client{Timeout: timeout},
-	}
+	}, nil
 }
 
-// Server integration ---------------------------------------------------------
+// validateHookURL rejects malformed or non-http(s) hook URLs at startup.
+func validateHookURL(env, raw string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%s: invalid URL %q: %w", env, raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("%s: URL scheme must be http or https, got %q", env, u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("%s: URL missing host: %q", env, raw)
+	}
+	return nil
+}
 
-func (s *Server) initInferenceHook() {
-	s.inferenceHook = newInferenceHook()
-	if s.inferenceHook != nil {
+func (s *Server) initInferenceHook() error {
+	h, err := newInferenceHook()
+	if err != nil {
+		return err
+	}
+	s.inferenceHook = h
+	if h != nil {
 		slog.Info("inference webhooks enabled",
-			"pre_url", s.inferenceHook.preURL,
-			"post_url", s.inferenceHook.postURL,
-			"on_error", s.inferenceHook.onError,
-			"timeout", s.inferenceHook.timeout)
+			"pre_url", redactURL(h.preURL),
+			"post_url", redactURL(h.postURL),
+			"on_error", h.onError,
+			"timeout", h.timeout)
 	}
+	return nil
 }
 
-// withInferenceHook wraps the given handler chain with the pre-inference
-// middleware when a pre URL is configured. When no pre URL is set, the
-// handlers pass through unchanged — zero overhead.
-//
-// Post-inference is NOT installed here — it must be invoked from within the
-// handler because it needs access to the response assembly point (the
-// channel in ChatHandler/GenerateHandler). See PostInference() below.
+// withInferenceHook prepends the pre-inference middleware when a pre URL
+// is configured, otherwise returns handlers unchanged. The post hook is
+// invoked from within the handlers via applyPostInference.
 func (s *Server) withInferenceHook(route string, handlers ...gin.HandlerFunc) []gin.HandlerFunc {
 	if s.inferenceHook == nil || s.inferenceHook.preURL == "" {
 		return handlers
@@ -102,38 +121,40 @@ func (s *Server) withInferenceHook(route string, handlers ...gin.HandlerFunc) []
 	return append([]gin.HandlerFunc{s.inferenceHook.preMiddleware(route)}, handlers...)
 }
 
-// hookedChain composes request-logging + pre-inference-hook + the given
-// protocol-conversion middlewares + the final handler into a single slice for
-// r.POST(...). It exists because the /v1/* routes otherwise devolve into
-// three-level-nested append() calls that are unreadable.
-//
-// Order: [requestLogging, [protocolConvert...], [preHook?], handler].
+// hookedChain composes requestLogging + protocol-conversion + preHook +
+// handler for r.POST. Order: [requestLogging, convert..., preHook?, handler].
 func (s *Server) hookedChain(route string, convert []gin.HandlerFunc, handler gin.HandlerFunc) []gin.HandlerFunc {
 	chain := append(convert, s.withInferenceHook(route, handler)...)
 	return s.withInferenceRequestLogging(route, chain...)
 }
 
-// Wire protocol types --------------------------------------------------------
+// HookSchemaVersion is stamped on every HookRequest. Hooks should
+// branch on it. Bump on any backwards-incompatible change.
+const HookSchemaVersion = 1
 
 // HookRequest is the JSON payload POSTed to a hook URL.
 type HookRequest struct {
-	Event      string         `json:"event"`
-	RequestID  string         `json:"request_id"`
-	Route      string         `json:"route"`
-	Model      string         `json:"model,omitempty"`
-	Messages   []HookMessage  `json:"messages,omitempty"`
-	Tools      []HookTool     `json:"tools,omitempty"`
-	Options    map[string]any `json:"options,omitempty"`
-	OutputText string         `json:"output_text,omitempty"`
-	ToolCalls  []HookToolCall `json:"tool_calls,omitempty"`
+	SchemaVersion  int            `json:"schema_version"`
+	Event          string         `json:"event"`
+	RequestID      string         `json:"request_id"`
+	Route          string         `json:"route"`
+	Model          string         `json:"model,omitempty"`
+	Messages       []HookMessage  `json:"messages,omitempty"`
+	Tools          []HookTool     `json:"tools,omitempty"`
+	Options        map[string]any `json:"options,omitempty"`
+	OutputText     string         `json:"output_text,omitempty"`
+	OutputThinking string         `json:"output_thinking,omitempty"`
+	ToolCalls      []HookToolCall `json:"tool_calls,omitempty"`
 }
 
 // HookMessage is an OpenAI-format chat message. Ollama's native shape is
-// normalized to this before sending to hooks so the wire contract is stable
-// across the /api/chat, /v1/chat/completions, and /v1/messages routes.
+// normalized to this so the wire contract is stable across /api/chat,
+// /v1/chat/completions, and /v1/messages. api.Message.Images is not
+// propagated in v1.
 type HookMessage struct {
 	Role       string         `json:"role"`
 	Content    string         `json:"content"`
+	Thinking   string         `json:"thinking,omitempty"`
 	ToolCalls  []HookToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string         `json:"tool_call_id,omitempty"`
 	Name       string         `json:"name,omitempty"`
@@ -162,56 +183,52 @@ type HookToolCallFn struct {
 	Arguments string `json:"arguments"`
 }
 
-// HookResponse is the JSON body expected from a hook URL.
-//
-// Action verbs are standardized across pre- and post-inference calls:
-//   - "allow":  proceed unchanged
-//   - "deny":   reject the request/response (returns HTTP 400)
-//   - "ask":    human-in-the-loop signal — reject the request/response with
-//              HTTP 403 and a body callers can surface as a confirmation
-//              prompt. Content is NOT revealed to the caller.
-//   - "modify": overwrite fields per the channel (messages pre, output/
-//              tool_calls post)
+// HookResponse is the JSON body expected from a hook URL. The
+// permission verbs align with Cursor's hooks contract; "modify" is an
+// Ollama-specific extension. See docs/inference-webhooks.mdx.
 type HookResponse struct {
-	Action     string         `json:"action"` // "allow" | "deny" | "ask" | "modify"
-	Reason     string         `json:"reason,omitempty"`
-	Messages   []HookMessage  `json:"messages,omitempty"`    // pre: modify
-	OutputText string         `json:"output_text,omitempty"` // post: modify
-	ToolCalls  []HookToolCall `json:"tool_calls,omitempty"`  // post: modify
+	Permission     string         `json:"permission"` // "allow" | "deny" | "ask" | "modify"
+	UserMessage    string         `json:"user_message,omitempty"`
+	AgentMessage   string         `json:"agent_message,omitempty"`
+	Messages       []HookMessage  `json:"messages,omitempty"`        // pre: modify
+	OutputText     string         `json:"output_text,omitempty"`     // post: modify
+	OutputThinking string         `json:"output_thinking,omitempty"` // post: modify
+	ToolCalls      []HookToolCall `json:"tool_calls,omitempty"`      // post: modify
 }
 
-// Pre-inference --------------------------------------------------------------
-
-// preMiddleware reads the inbound body, converts it to a normalized hook
-// payload, calls the configured URL, and either aborts the request (block),
-// rewrites the body (modify), or continues (allow).
-//
-// The middleware runs AFTER format-conversion middleware for /v1/* routes so
-// the body it reads is already in api.ChatRequest / api.GenerateRequest
-// shape.
+// preMiddleware reads the inbound body, calls the hook, and applies
+// the returned permission. Must run AFTER format-conversion middleware
+// on /v1/* routes so it sees the normalized api.ChatRequest /
+// api.GenerateRequest body.
 func (h *inferenceHook) preMiddleware(route string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if c.Request == nil || c.Request.Body == nil {
 			c.Next()
 			return
 		}
-		body, err := io.ReadAll(c.Request.Body)
+		// +1 byte so we can tell "at limit" from "oversized".
+		body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxInboundBody+1))
 		if err != nil {
 			slog.Warn("inference hook: read body", "route", route, "err", err)
 			c.Request.Body = io.NopCloser(bytes.NewReader(body))
 			c.Next()
 			return
 		}
+		if int64(len(body)) > maxInboundBody {
+			c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, gin.H{
+				"error": fmt.Sprintf("request body exceeds %d bytes", maxInboundBody),
+			})
+			return
+		}
 		c.Request.Body = io.NopCloser(bytes.NewReader(body))
 
 		reqID := uuid.NewString()
 		c.Set("inference_hook_request_id", reqID)
+		c.Header(headerRequestID, reqID)
 
 		payload, buildErr := buildPrePayload(route, reqID, body)
 		if buildErr != nil {
-			// Not an error we block on — the route may not carry inference
-			// payloads (e.g., someone mis-wired this middleware). Pass
-			// through.
+			// Non-inference body; pass through.
 			slog.Debug("inference hook: non-inference body", "route", route, "err", buildErr)
 			c.Next()
 			return
@@ -220,43 +237,41 @@ func (h *inferenceHook) preMiddleware(route string) gin.HandlerFunc {
 		res, err := h.call(c.Request.Context(), h.preURL, "pre_inference", payload)
 		if err != nil {
 			if h.onError == "allow" {
-				slog.Warn("inference hook: pre call failed, fail-open", "route", route, "err", err)
+				logFailOpen("pre", route, err)
 				c.Next()
 				return
 			}
 			slog.Warn("inference hook: pre call failed, fail-closed", "route", route, "err", err)
-			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
-				"error": "inference hook unavailable",
-			})
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, unavailableBody())
 			return
 		}
 
-		switch res.Action {
+		switch res.Permission {
 		case "deny":
-			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
-				"action": "deny",
-				"error":  "denied by inference hook: " + res.Reason,
-				"reason": res.Reason,
-			})
+			user, agent := sanitizeReason(res.UserMessage), sanitizeReason(res.AgentMessage)
+			c.AbortWithStatusJSON(http.StatusBadRequest, denyBody("denied", user, agent))
 			return
 		case "ask":
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-				"action": "ask",
-				"error":  "approval required by inference hook: " + res.Reason,
-				"reason": res.Reason,
-			})
+			user, agent := sanitizeReason(res.UserMessage), sanitizeReason(res.AgentMessage)
+			c.AbortWithStatusJSON(http.StatusForbidden, askBody(user, agent))
 			return
 		case "modify":
 			newBody, err := applyPreModify(body, res.Messages)
 			if err != nil {
+				// Shape-unsupported is hook misconfiguration, not
+				// transient failure; bypass onError=allow so every
+				// modify doesn't silently drop.
+				if errors.Is(err, errModifyShapeUnsupported) {
+					slog.Warn("inference hook: modify shape unsupported", "route", route, "err", err)
+					c.AbortWithStatusJSON(http.StatusBadGateway, modifyFailedBody(err.Error()))
+					return
+				}
 				slog.Warn("inference hook: apply modify", "route", route, "err", err)
 				if h.onError == "allow" {
 					c.Next()
 					return
 				}
-				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
-					"error": "inference hook modify failed",
-				})
+				c.AbortWithStatusJSON(http.StatusInternalServerError, modifyFailedBody(""))
 				return
 			}
 			c.Request.Body = io.NopCloser(bytes.NewReader(newBody))
@@ -267,8 +282,15 @@ func (h *inferenceHook) preMiddleware(route string) gin.HandlerFunc {
 			c.Next()
 			return
 		default:
-			slog.Warn("inference hook: unknown action", "route", route, "action", res.Action)
-			c.Next()
+			// Unknown permission = misconfig; refuse rather than silently allow.
+			perm := sanitizeReason(res.Permission)
+			slog.Warn("inference hook: unknown permission, treating as deny",
+				"route", route, "permission", perm)
+			c.AbortWithStatusJSON(http.StatusBadRequest, denyBody(
+				"denied",
+				"hook returned unknown permission",
+				"hook returned unknown permission "+perm,
+			))
 			return
 		}
 	}
@@ -279,9 +301,10 @@ func (h *inferenceHook) preMiddleware(route string) gin.HandlerFunc {
 // parse as either.
 func buildPrePayload(route, requestID string, body []byte) (HookRequest, error) {
 	hp := HookRequest{
-		Event:     "pre_inference",
-		RequestID: requestID,
-		Route:     route,
+		SchemaVersion: HookSchemaVersion,
+		Event:         "pre_inference",
+		RequestID:     requestID,
+		Route:         route,
 	}
 
 	// Try chat first.
@@ -311,13 +334,19 @@ func buildPrePayload(route, requestID string, body []byte) (HookRequest, error) 
 	return hp, errors.New("not a chat or generate request")
 }
 
-// applyPreModify replaces the messages in the body with those from the hook
-// response. Preserves other fields on the request (model, options, tools,
-// etc.) exactly. Works for both api.ChatRequest and api.GenerateRequest
-// shapes.
+// errModifyShapeUnsupported is returned when a modify response cannot
+// be represented by the inbound request shape (today: /api/generate,
+// which accepts only one system + one user prompt).
+var errModifyShapeUnsupported = errors.New("modify result unsupported on this route")
+
+// applyPreModify replaces the messages in the body with those from the
+// hook response, preserving other request fields.
+//
+// Invariant: we decode to map[string]json.RawMessage so any top-level
+// field absent from HookMessage (including future additions to
+// api.ChatRequest) round-trips byte-for-byte. Modify only touches
+// "messages" (chat) or "prompt"/"system" (generate).
 func applyPreModify(body []byte, modified []HookMessage) ([]byte, error) {
-	// Detect which request shape this is by probing for the "messages" key.
-	// We decode to map[string]any to preserve all other fields as-is.
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, err
@@ -330,8 +359,11 @@ func applyPreModify(body []byte, modified []HookMessage) ([]byte, error) {
 		raw["messages"] = modRaw
 		return json.Marshal(raw)
 	}
-	// Generate request: pick the last message of role != system as prompt,
-	// system message as system.
+	// Generate path: refuse anything we cannot represent as system + user
+	// rather than silently dropping the rest.
+	if err := validateGenerateModifyShape(modified); err != nil {
+		return nil, err
+	}
 	var newSystem, newPrompt string
 	for _, m := range modified {
 		if strings.EqualFold(m.Role, "system") {
@@ -351,101 +383,216 @@ func applyPreModify(body []byte, modified []HookMessage) ([]byte, error) {
 	return json.Marshal(raw)
 }
 
-// Post-inference -------------------------------------------------------------
-
-// PostInferenceResult is the outcome of a post-inference hook call, as seen
-// by ChatHandler / GenerateHandler.
-type PostInferenceResult struct {
-	// Action is one of "allow" | "deny" | "ask" | "modify". When the hook
-	// is not configured or the verdict is allow/modify, callers should emit
-	// the response normally (using possibly-updated OutputText/ToolCalls).
-	// "deny" and "ask" are terminal — callers must abort with the matching
-	// status code (400 for deny, 403 for ask).
-	Action     string
-	Reason     string
-	OutputText string
-	ToolCalls  []HookToolCall
+// validateGenerateModifyShape enforces the /api/generate constraint:
+// at most one system + exactly one user (empty role counts as user).
+func validateGenerateModifyShape(messages []HookMessage) error {
+	var systemCount, userCount int
+	for _, m := range messages {
+		switch strings.ToLower(m.Role) {
+		case "system":
+			systemCount++
+		case "user", "":
+			userCount++
+		default:
+			return fmt.Errorf("%w: cannot carry role %q on /api/generate; use a chat endpoint for multi-role rewrites",
+				errModifyShapeUnsupported, m.Role)
+		}
+	}
+	if systemCount > 1 {
+		return fmt.Errorf("%w: produced %d system messages; /api/generate accepts at most one",
+			errModifyShapeUnsupported, systemCount)
+	}
+	if userCount != 1 {
+		return fmt.Errorf("%w: produced %d user messages; /api/generate requires exactly one",
+			errModifyShapeUnsupported, userCount)
+	}
+	return nil
 }
 
-// HTTPStatus returns the status code to respond with when Action is a
-// terminal verdict. Returns 0 for non-terminal actions (allow/modify).
+// postInferenceUnavailable is an internal permission returned when the
+// post-hook is unreachable under fail-closed. Kept distinct from "deny"
+// so 503 (infrastructure) doesn't collide with 400 (policy).
+const postInferenceUnavailable = "unavailable"
+
+// PostInferenceResult is the outcome of a post-inference hook call.
+type PostInferenceResult struct {
+	// Permission: "allow" | "deny" | "ask" | "modify" | "unavailable".
+	// "deny", "ask", and "unavailable" are terminal (400 / 403 / 503).
+	Permission     string
+	UserMessage    string
+	AgentMessage   string
+	OutputText     string
+	OutputThinking string
+	ToolCalls      []HookToolCall
+}
+
+// HTTPStatus returns the status code for a terminal verdict, or 0 for
+// non-terminal ones (allow/modify).
 func (r PostInferenceResult) HTTPStatus() int {
-	switch r.Action {
+	switch r.Permission {
 	case "deny":
 		return http.StatusBadRequest
 	case "ask":
 		return http.StatusForbidden
+	case postInferenceUnavailable:
+		return http.StatusServiceUnavailable
 	default:
 		return 0
 	}
 }
 
-// Terminated reports whether the caller must abort the response rather than
-// return the content.
+// Terminated reports whether the caller must abort the response.
 func (r PostInferenceResult) Terminated() bool {
-	return r.Action == "deny" || r.Action == "ask"
+	return r.Permission == "deny" || r.Permission == "ask" || r.Permission == postInferenceUnavailable
 }
 
-// callPostInference is an internal helper — most callers should use
-// Server.PostInference(c, ...).
-func (s *Server) callPostInference(c *gin.Context, route, model, outputText string, toolCalls []HookToolCall) PostInferenceResult {
+func (s *Server) callPostInference(c *gin.Context, route, model, outputText, outputThinking string, toolCalls []HookToolCall) PostInferenceResult {
 	if s.inferenceHook == nil || s.inferenceHook.postURL == "" {
-		return PostInferenceResult{Action: "allow", OutputText: outputText, ToolCalls: toolCalls}
+		return PostInferenceResult{
+			Permission:     "allow",
+			OutputText:     outputText,
+			OutputThinking: outputThinking,
+			ToolCalls:      toolCalls,
+		}
 	}
 
-	reqID, _ := c.Get("inference_hook_request_id")
-	reqIDStr, _ := reqID.(string)
+	// Reuse the pre-middleware's request id when present; otherwise
+	// generate one for post-only deployments so the hook call and the
+	// client response correlate.
+	reqIDStr, _ := c.Get("inference_hook_request_id")
+	reqID, _ := reqIDStr.(string)
+	if reqID == "" {
+		reqID = uuid.NewString()
+		c.Set("inference_hook_request_id", reqID)
+	}
+	c.Header(headerRequestID, reqID)
 
 	payload := HookRequest{
-		Event:      "post_inference",
-		RequestID:  reqIDStr,
-		Route:      route,
-		Model:      model,
-		OutputText: outputText,
-		ToolCalls:  toolCalls,
+		SchemaVersion:  HookSchemaVersion,
+		Event:          "post_inference",
+		RequestID:      reqID,
+		Route:          route,
+		Model:          model,
+		OutputText:     outputText,
+		OutputThinking: outputThinking,
+		ToolCalls:      toolCalls,
 	}
 
 	res, err := s.inferenceHook.call(c.Request.Context(), s.inferenceHook.postURL, "post_inference", payload)
 	if err != nil {
 		if s.inferenceHook.onError == "allow" {
-			slog.Warn("inference hook: post call failed, fail-open", "route", route, "err", err)
-			return PostInferenceResult{Action: "allow", OutputText: outputText, ToolCalls: toolCalls}
+			logFailOpen("post", route, err)
+			return PostInferenceResult{
+				Permission:     "allow",
+				OutputText:     outputText,
+				OutputThinking: outputThinking,
+				ToolCalls:      toolCalls,
+			}
 		}
 		slog.Warn("inference hook: post call failed, fail-closed", "route", route, "err", err)
-		return PostInferenceResult{Action: "deny", Reason: "post hook unavailable"}
+		return PostInferenceResult{
+			Permission:  postInferenceUnavailable,
+			UserMessage: "post hook unavailable",
+		}
 	}
 
-	switch res.Action {
+	switch res.Permission {
 	case "deny":
-		return PostInferenceResult{Action: "deny", Reason: res.Reason}
+		return PostInferenceResult{
+			Permission:   "deny",
+			UserMessage:  res.UserMessage,
+			AgentMessage: res.AgentMessage,
+		}
 	case "ask":
-		return PostInferenceResult{Action: "ask", Reason: res.Reason}
+		return PostInferenceResult{
+			Permission:   "ask",
+			UserMessage:  res.UserMessage,
+			AgentMessage: res.AgentMessage,
+		}
 	case "modify":
 		if res.OutputText != "" {
 			outputText = res.OutputText
 		}
+		if res.OutputThinking != "" {
+			outputThinking = res.OutputThinking
+		}
 		if res.ToolCalls != nil {
 			toolCalls = res.ToolCalls
 		}
-		return PostInferenceResult{Action: "modify", Reason: res.Reason, OutputText: outputText, ToolCalls: toolCalls}
+		return PostInferenceResult{
+			Permission:     "modify",
+			UserMessage:    res.UserMessage,
+			AgentMessage:   res.AgentMessage,
+			OutputText:     outputText,
+			OutputThinking: outputThinking,
+			ToolCalls:      toolCalls,
+		}
 	default:
-		return PostInferenceResult{Action: "allow", OutputText: outputText, ToolCalls: toolCalls}
+		return PostInferenceResult{
+			Permission:     "allow",
+			OutputText:     outputText,
+			OutputThinking: outputThinking,
+			ToolCalls:      toolCalls,
+		}
 	}
 }
 
-// PostInference is the exported post-inference hook entry point used by
-// ChatHandler/GenerateHandler. Returns an "allow" result when the hook is not
-// configured, so handlers can call it unconditionally.
-func (s *Server) PostInference(c *gin.Context, route, model, outputText string, toolCalls []HookToolCall) PostInferenceResult {
-	return s.callPostInference(c, route, model, outputText, toolCalls)
+// PostInference invokes the post-inference hook. Returns an allow
+// result when the hook is unconfigured so handlers can call it
+// unconditionally.
+func (s *Server) PostInference(c *gin.Context, route, model, outputText, outputThinking string, toolCalls []HookToolCall) PostInferenceResult {
+	return s.callPostInference(c, route, model, outputText, outputThinking, toolCalls)
 }
 
-// PostInferenceConfigured reports whether a post-inference URL has been
-// configured. Handlers can skip assembling the hook payload when no one is
-// listening.
+// PostInferenceConfigured reports whether a post-inference URL is set.
 func (s *Server) PostInferenceConfigured() bool {
 	return s.inferenceHook != nil && s.inferenceHook.postURL != ""
 }
+
+// applyPostInference invokes the post-hook and applies its verdict. On
+// a terminal verdict it writes the HTTP body and returns done=true so
+// the caller can return.
+func (s *Server) applyPostInference(c *gin.Context, route, model, outputText, outputThinking string, toolCalls []api.ToolCall) (string, string, []api.ToolCall, bool) {
+	if !s.PostInferenceConfigured() {
+		return outputText, outputThinking, toolCalls, false
+	}
+	verdict := s.PostInference(c, route, model, outputText, outputThinking, toolCallsToHook(toolCalls))
+	if !verdict.Terminated() {
+		return verdict.OutputText, verdict.OutputThinking, toolCallsFromHook(verdict.ToolCalls), false
+	}
+	switch verdict.Permission {
+	case postInferenceUnavailable:
+		c.AbortWithStatusJSON(http.StatusServiceUnavailable, unavailableBody())
+	case "ask":
+		c.AbortWithStatusJSON(verdict.HTTPStatus(), askBody(
+			sanitizeReason(verdict.UserMessage),
+			sanitizeReason(verdict.AgentMessage),
+		))
+	default:
+		c.AbortWithStatusJSON(verdict.HTTPStatus(), denyBody(
+			"denied",
+			sanitizeReason(verdict.UserMessage),
+			sanitizeReason(verdict.AgentMessage),
+		))
+	}
+	return outputText, outputThinking, toolCalls, true
+}
+
+// WarnStreamingPostHookSkipped emits a one-shot warning when a streamed
+// request arrives with a post-hook configured; streaming bypasses the
+// post hook today (see docs/inference-webhooks.mdx).
+func (s *Server) WarnStreamingPostHookSkipped(route string) {
+	if !s.PostInferenceConfigured() {
+		return
+	}
+	streamingPostHookWarnOnce.Do(func() {
+		slog.Warn("inference hook: post-inference webhook is skipped for streaming responses; "+
+			"set stream=false if post-inference enforcement is required",
+			"route", route)
+	})
+}
+
+var streamingPostHookWarnOnce sync.Once
 
 // call is the shared HTTP round-trip helper for pre and post.
 func (h *inferenceHook) call(ctx context.Context, url, event string, payload HookRequest) (HookResponse, error) {
@@ -464,8 +611,9 @@ func (h *inferenceHook) call(ctx context.Context, url, event string, payload Hoo
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", hookUserAgent)
 	req.Header.Set("X-Ollama-Hook-Event", event)
-	req.Header.Set("X-Ollama-Request-Id", payload.RequestID)
+	req.Header.Set(headerRequestID, payload.RequestID)
 	for k, vals := range h.headers {
 		for _, v := range vals {
 			req.Header.Add(k, v)
@@ -478,10 +626,7 @@ func (h *inferenceHook) call(ctx context.Context, url, event string, payload Hoo
 	}
 	defer resp.Body.Close()
 
-	// Read up to maxHookBody+1 bytes so we can distinguish "exactly at the
-	// limit" from "oversized". Silently truncating to the limit and handing
-	// a partial buffer to json.Unmarshal produces a confusing decode error
-	// that hides the real cause.
+	// +1 byte so we can tell "at limit" from "oversized" below.
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxHookBody+1))
 	if err != nil {
 		return out, fmt.Errorf("read hook body: %w", err)
@@ -498,12 +643,8 @@ func (h *inferenceHook) call(ctx context.Context, url, event string, payload Hoo
 	return out, nil
 }
 
-// maxHookBody caps the size of a hook response body we're willing to buffer.
-// Hooks that need to return larger payloads should use request rewriting or
-// reduce verbosity.
+// maxHookBody caps the size of a hook response body we will buffer.
 const maxHookBody int64 = 4 << 20
-
-// Conversions ---------------------------------------------------------------
 
 func messagesToHook(in []api.Message) []HookMessage {
 	out := make([]HookMessage, 0, len(in))
@@ -511,6 +652,7 @@ func messagesToHook(in []api.Message) []HookMessage {
 		hm := HookMessage{
 			Role:       strings.ToLower(m.Role),
 			Content:    m.Content,
+			Thinking:   m.Thinking,
 			ToolCallID: m.ToolCallID,
 			Name:       m.ToolName,
 		}
@@ -529,9 +671,8 @@ func messagesToHook(in []api.Message) []HookMessage {
 	return out
 }
 
-// toolCallsToHook converts api.ToolCall (used in assembled responses) to the
-// wire-format HookToolCall. Arguments are serialized as a JSON string, which
-// is the OpenAI tool-call convention and the shape hook servers expect.
+// toolCallsToHook converts api.ToolCall to the wire-format HookToolCall.
+// Arguments are serialized as a JSON string (OpenAI convention).
 func toolCallsToHook(in []api.ToolCall) []HookToolCall {
 	if len(in) == 0 {
 		return nil
@@ -550,10 +691,8 @@ func toolCallsToHook(in []api.ToolCall) []HookToolCall {
 	return out
 }
 
-// toolCallsFromHook reverses the conversion for post-inference modify. Parses
-// the Arguments JSON string back into an ordered-map. On parse failure leaves
-// the arguments empty rather than returning the attacker-controlled string —
-// callers treat this as "hook returned unusable args, drop them".
+// toolCallsFromHook reverses toolCallsToHook. Parse failures leave
+// Arguments empty rather than reflecting the attacker-controlled string.
 func toolCallsFromHook(in []HookToolCall) []api.ToolCall {
 	if len(in) == 0 {
 		return nil
@@ -575,17 +714,18 @@ func toolCallsFromHook(in []HookToolCall) []api.ToolCall {
 	return out
 }
 
-// messagesFromHook reverses the conversion for modified messages. Loses any
-// data that wasn't on the hook side (e.g., images) — the hook side operates
-// on text only in v1.
+// messagesFromHook reverses messagesToHook. api.Message.Images is not
+// carried in the v1 wire format, so a multimodal modify drops images.
 func messagesFromHook(in []HookMessage) []api.Message {
 	out := make([]api.Message, 0, len(in))
 	for _, m := range in {
 		out = append(out, api.Message{
 			Role:       m.Role,
 			Content:    m.Content,
+			Thinking:   m.Thinking,
 			ToolName:   m.Name,
 			ToolCallID: m.ToolCallID,
+			ToolCalls:  toolCallsFromHook(m.ToolCalls),
 		})
 	}
 	return out
@@ -604,8 +744,7 @@ func toolsToHook(in api.Tools) []HookTool {
 			params := map[string]any{
 				"type": t.Function.Parameters.Type,
 			}
-			// Best-effort serialization — we only need to hand something
-			// off; we don't roundtrip it.
+			// Best-effort; not round-tripped.
 			if raw, err := json.Marshal(t.Function.Parameters); err == nil {
 				var decoded map[string]any
 				if json.Unmarshal(raw, &decoded) == nil {
@@ -619,7 +758,64 @@ func toolsToHook(in api.Tools) []HookTool {
 	return out
 }
 
-// --- tiny helpers ---
+// hookUserAgent identifies Ollama in outbound hook calls. Bumped
+// alongside the wire-format major.
+const hookUserAgent = "ollama-hooks/1"
+
+// headerRequestID is stamped on outbound hook calls and reflected on
+// responses so audit logs can correlate the two ends.
+const headerRequestID = "X-Ollama-Request-Id"
+
+// hookErrorBody is the standard envelope for hook-decision responses:
+// top-level "error" for clients that read only that field, plus a
+// nested "hook" object with the structured fields. Empty user_message
+// and agent_message are omitted from the nested object.
+func hookErrorBody(message, permission, userMessage, agentMessage string) gin.H {
+	hook := gin.H{"permission": permission}
+	if userMessage != "" {
+		hook["user_message"] = userMessage
+	}
+	if agentMessage != "" {
+		hook["agent_message"] = agentMessage
+	}
+	return gin.H{
+		"error": message,
+		"hook":  hook,
+	}
+}
+
+func denyBody(label, userMessage, agentMessage string) gin.H {
+	msg := label + " by inference hook"
+	if userMessage != "" {
+		msg = msg + ": " + userMessage
+	}
+	return hookErrorBody(msg, "deny", userMessage, agentMessage)
+}
+
+func askBody(userMessage, agentMessage string) gin.H {
+	msg := "approval required by inference hook"
+	if userMessage != "" {
+		msg = msg + ": " + userMessage
+	}
+	return hookErrorBody(msg, "ask", userMessage, agentMessage)
+}
+
+// unavailableBody is returned on fail-closed when the hook is
+// unreachable. The "unavailable" permission distinguishes it from a
+// hook-returned deny.
+func unavailableBody() gin.H {
+	return hookErrorBody("inference hook unavailable", postInferenceUnavailable, "", "")
+}
+
+// modifyFailedBody is returned when Ollama cannot apply a hook's
+// modify response. detail is appended to the error message.
+func modifyFailedBody(detail string) gin.H {
+	msg := "inference hook modify failed"
+	if detail != "" {
+		msg = msg + ": " + detail
+	}
+	return hookErrorBody(msg, "modify", "", "")
+}
 
 // truncateForError keeps error messages a bounded length.
 func truncateForError(s string, n int) string {
@@ -628,3 +824,73 @@ func truncateForError(s string, n int) string {
 	}
 	return s[:n] + "…"
 }
+
+// maxInboundBody caps the request body the hook middleware will
+// buffer; exceeding returns 413.
+const maxInboundBody int64 = 32 << 20 // 32 MiB
+
+// sanitizeReason bounds a hook-provided reason string and strips
+// control characters to prevent log corruption and HTTP response
+// splitting when reflected into a response body.
+func sanitizeReason(s string) string {
+	if s == "" {
+		return ""
+	}
+	const max = 256
+	if len(s) > max {
+		s = s[:max]
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r == '\n', r == '\r', r == '\t':
+			b.WriteByte(' ')
+		case r < 0x20, r == 0x7f:
+			// drop other control chars
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// redactURL returns raw with userinfo replaced by "REDACTED" so
+// embedded credentials don't spill into logs. Parse failures return an
+// opaque marker.
+func redactURL(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<unparseable url>"
+	}
+	if u.User != nil {
+		u.User = url.User("REDACTED")
+	}
+	return u.String()
+}
+
+// logFailOpen emits a Warn the first time a channel ("pre" or "post")
+// fails open in this process, then demotes subsequent events to Debug.
+func logFailOpen(channel, route string, err error) {
+	var first bool
+	switch channel {
+	case "pre":
+		preFailOpenOnce.Do(func() { first = true })
+	case "post":
+		postFailOpenOnce.Do(func() { first = true })
+	}
+	if first {
+		slog.Warn("inference hook: fail-open engaged; subsequent fail-opens on this channel demoted to debug",
+			"channel", channel, "route", route, "err", err)
+		return
+	}
+	slog.Debug("inference hook: fail-open", "channel", channel, "route", route, "err", err)
+}
+
+var (
+	preFailOpenOnce  sync.Once
+	postFailOpenOnce sync.Once
+)
